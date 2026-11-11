@@ -1,0 +1,443 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>logic tests</title>
+<pre id="out">running</pre>
+<script type="module">
+import {
+  splitToll, candidates, autoAssign, moveRider, allocationView, tollForCar,
+  tollSummary, buildResultText, buildResultBody, buildAnnouncement, lineShareUrl, formatDate,
+  parseRoster, applyRoster, decodeRosterFile, householdAttend, seatCount, carName, legsOf, legName, legLabel, legRoute, eventRoster, setCarUsed, carCount, maxCarsOf,
+} from '../src/logic.js';
+
+const results = [];
+function test(name, fn) {
+  try { fn(); results.push(`ok   ${name}`); }
+  catch (e) { results.push(`FAIL ${name}: ${e.message}`); }
+}
+function eq(actual, expected) {
+  const a = JSON.stringify(actual), b = JSON.stringify(expected);
+  if (a !== b) throw new Error(`got ${a}, want ${b}`);
+}
+function ok(value, msg) { if (!value) throw new Error(msg); }
+
+const P = (id, childIds) => ({ id, name: id, type: 'parent', childIds: childIds ?? [] });
+const C = (id) => ({ id, name: id, type: 'player' });
+const roster = [C('k1'), C('k2'), C('k3'), C('k4'), P('dad', ['k2']), P('mom'), P('adult')];
+const yes = (out, back = out, seats = 0) => ({ attend: 'yes', out, back, seats });
+const baseResponses = () => ({
+  k1: yes('ride'), k2: yes('ride'), k3: yes('ride'),
+  dad: yes('car', 'car', 2), mom: yes('car', 'none', 2), adult: yes('ride', 'none'),
+});
+
+test('600円÷3人は200円', () => eq(splitToll(600, 3), 200));
+test('600円÷7人は1円単位切り上げで86円', () => eq(splitToll(600, 7), 86));
+test('0人なら0円', () => eq(splitToll(600, 0), 0));
+
+test('未回答の部員は配車対象外', () => {
+  const { riders } = candidates(roster, baseResponses(), 'out');
+  ok(!riders.some((r) => r.id === 'k4'), 'k4は未回答');
+});
+test('不参加は配車対象外', () => {
+  const r = baseResponses(); r.k1 = { attend: 'no' };
+  ok(!candidates(roster, r, 'out').riders.some((p) => p.id === 'k1'), 'k1は不参加');
+});
+test('行きだけ車を出す人は帰りの運転者に含まない', () => {
+  eq(candidates(roster, baseResponses(), 'back').drivers.map((d) => d.id), ['dad']);
+});
+
+test('親の車に自分の子が優先される', () => {
+  const cars = autoAssign(roster, baseResponses(), 'out');
+  ok(cars.find((c) => c.driverId === 'dad').riderIds.includes('k2'), 'k2はdadの車');
+});
+test('自分の子は乗車可能人数に数えない', () => {
+  const r = baseResponses();
+  const v = allocationView(autoAssign(roster, r, 'back'), roster, r, 'back');
+  const dad = v.cars[0];
+  eq([dad.riders.length, dad.used, dad.seats, dad.over, v.unassigned.length], [3, 2, 2, false, 0]);
+});
+test('定員を超えて自動で割り当てない', () => {
+  const r = baseResponses();
+  r.dad.seats = 1;
+  const cars = autoAssign(roster, r, 'back');
+  eq(cars[0].riderIds.length, 2);
+});
+test('席が足りない分は未割当になる', () => {
+  const r = baseResponses();
+  r.dad.seats = 1;
+  const v = allocationView(autoAssign(roster, r, 'back'), roster, r, 'back');
+  eq(v.unassigned.length, 1);
+});
+test('乗車可能人数0でも自分の子は乗れる', () => {
+  const r = baseResponses();
+  r.dad.seats = 0;
+  const cars = autoAssign(roster, r, 'back');
+  eq(cars[0].riderIds, ['k2']);
+});
+test('自分の子以外で定員を超えると警告フラグが立つ', () => {
+  const r = baseResponses();
+  r.dad.seats = 1;
+  const v = allocationView([{ driverId: 'dad', riderIds: ['k1', 'k2', 'k3'] }], roster, r, 'out');
+  ok(v.cars[0].over, 'k1とk3で定員超過');
+});
+test('自分の子も道路料金の人数には含まれる', () => {
+  const r = baseResponses();
+  const v = allocationView([{ driverId: 'dad', riderIds: ['k1', 'k2'] }], roster, r, 'out');
+  eq(tollForCar(v.cars[0], 600).share, 300);
+});
+test('運転手の父母が配車結果に入る', () => {
+  const r = baseResponses();
+  r.dad.driver = 'mother';
+  const v = allocationView([{ driverId: 'dad', riderIds: ['k1'] }], roster, r, 'out');
+  eq(v.cars[0].driverLabel, '母');
+  const event = { title: 't', date: '2026-11-15', destination: 'd', meetTime: '8:00', tollOut: false, tollBack: false };
+  const t = buildResultText(event, { out: { cars: [v.cars[0]], unassigned: [] }, back: { cars: [], unassigned: [] } });
+  ok(t.includes('dad号（運転手：母）：k2、k1'), '運転手の表示');
+});
+
+test('手動で別の車へ移せる', () => {
+  const cars = moveRider([{ driverId: 'dad', riderIds: ['k1'] }, { driverId: 'mom', riderIds: [] }], 'k1', 'mom');
+  eq(cars, [{ driverId: 'dad', riderIds: [] }, { driverId: 'mom', riderIds: ['k1'] }]);
+});
+test('未割当へ戻せる', () => {
+  eq(moveRider([{ driverId: 'dad', riderIds: ['k1'] }], 'k1', ''), [{ driverId: 'dad', riderIds: [] }]);
+});
+test('手動で定員超過にすると警告フラグが立つ', () => {
+  const r = baseResponses();
+  r.mom.seats = 1;
+  const v = allocationView([{ driverId: 'mom', riderIds: ['k1', 'k3'] }], roster, r, 'out');
+  ok(v.cars.find((c) => c.driver.id === 'mom').over, 'overになる');
+});
+test('親が配車できると、配車不要と答えた部員も親の車に乗る', () => {
+  const r = baseResponses();
+  r.k2 = yes('none');
+  ok(autoAssign(roster, r, 'out').find((c) => c.driverId === 'dad').riderIds.includes('k2'), 'k2はdadの車');
+});
+test('親が配車しない方向は部員の回答どおり', () => {
+  const r = baseResponses();
+  r.k2 = yes('none');
+  r.dad = { attend: 'yes', out: 'none', back: 'car', seats: 2 };
+  ok(!candidates(roster, r, 'out').riders.some((p) => p.id === 'k2'), '行きは対象外');
+  ok(candidates(roster, r, 'back').riders.some((p) => p.id === 'k2'), '帰りは親の車');
+});
+test('不参加の部員は親が配車できても乗らない', () => {
+  const r = baseResponses();
+  r.k2 = { attend: 'no' };
+  ok(!candidates(roster, r, 'out').riders.some((p) => p.id === 'k2'), '不参加');
+});
+test('他の車に保存されていても親の車へ戻される', () => {
+  const r = baseResponses();
+  const v = allocationView([{ driverId: 'mom', riderIds: ['k2', 'k1'] }], roster, r, 'out');
+  eq(v.cars.find((c) => c.driver.id === 'mom').riders.map((x) => x.person.id), ['k1']);
+  eq(v.cars.find((c) => c.driver.id === 'dad').riders.map((x) => x.person.id), ['k2']);
+});
+test('後から親が配車可能にすると親の車へ移る', () => {
+  const r = baseResponses();
+  r.dad = { attend: 'yes', out: 'ride', back: 'ride', seats: 0 };
+  const saved = autoAssign(roster, r, 'out');
+  r.dad = yes('car', 'car', 2);
+  const v = allocationView(saved, roster, r, 'out');
+  ok(v.cars.find((c) => c.driver.id === 'dad').riders.some((x) => x.person.id === 'k2'), '親の車へ');
+});
+test('送迎のみの人は運転者になれる', () => {
+  const r = baseResponses();
+  r.dad = { attend: 'shuttle', out: 'car', back: 'none', seats: 2 };
+  ok(candidates(roster, r, 'out').drivers.some((d) => d.id === 'dad'), '運転者');
+});
+test('送迎のみの人は同乗者にならない', () => {
+  const r = baseResponses();
+  r.adult = { attend: 'shuttle', out: 'ride', back: 'none', seats: 0 };
+  ok(!candidates(roster, r, 'out').riders.some((p) => p.id === 'adult'), '同乗者ではない');
+});
+test('車は「〇〇号」と表記する', () => {
+  const driver = { id: 'h', name: '青木家', type: 'parent', childIds: [] };
+  const car = { driver, driverLabel: '', seats: 3, used: 0, riders: [], over: false };
+  const event = { title: 't', date: '2026-11-15', destination: 'd', meetTime: '8:00', tollOut: false, tollBack: false };
+  ok(buildResultText(event, { out: { cars: [car], unassigned: [] }, back: { cars: [], unassigned: [] } }).includes('■青木家号：'), '表記');
+});
+test('名字だけの世帯は「青木号」、名前に「さん」は付けない', () => {
+  eq(carName({ name: '青木', type: 'parent' }), '青木号');
+  eq(carName({ name: '佐々木監督', type: 'coach' }), '佐々木監督号');
+  const driver = { id: 'h', name: '青木', type: 'parent', childIds: [] };
+  const rider = { person: { id: 'e', name: '遠藤', type: 'parent' }, seats: 2 };
+  const car = { driver, driverLabel: '父', seats: 3, used: 2, riders: [rider], over: false };
+  const event = { title: 't', date: '2026-11-15', destination: 'd', meetTime: '8:00', tollOut: false, tollBack: false };
+  ok(buildResultText(event, { out: { cars: [car], unassigned: [] }, back: { cars: [], unassigned: [] } })
+    .includes('■青木号（運転手：父）：遠藤（2人）'), '表記');
+});
+test('配車後に不参加へ変えた人はstaleになる', () => {
+  const r = baseResponses();
+  const saved = [{ driverId: 'mom', riderIds: ['k1'] }];
+  r.k1 = { attend: 'no' };
+  const v = allocationView(saved, roster, r, 'out');
+  ok(v.cars.find((c) => c.driver.id === 'mom').riders[0].stale, 'staleになる');
+});
+test('後から回答した人は未割当に現れ、既存の配車は保たれる', () => {
+  const r = baseResponses();
+  const saved = autoAssign(roster, r, 'out');
+  r.k4 = yes('ride');
+  const v = allocationView(saved, roster, r, 'out');
+  ok(v.unassigned.some((p) => p.id === 'k4'), 'k4が未割当');
+  eq(v.cars.flatMap((c) => c.riders).length, 4);
+});
+
+const carOf = (riders, driver = P('dad', ['k2'])) => ({
+  driver, seats: 4, over: false, riders: riders.map((person) => ({ person, stale: false })),
+});
+test('大人は人数に入らず負担もしない', () => {
+  const t = tollForCar(carOf([C('k1'), C('k2'), P('adult')]), 600);
+  eq([t.payers.length, t.share, t.total], [2, 300, 600]);
+});
+test('大人だけの車は料金が発生しない', () => {
+  eq(tollForCar(carOf([P('adult')]), 600).total, 0);
+});
+test('運転者の子も既定では割り勘に含む', () => {
+  eq(tollForCar(carOf([C('k1'), C('k2')]), 600).share, 300);
+});
+test('設定で運転者の子を除ける', () => {
+  eq(tollForCar(carOf([C('k1'), C('k2')]), 600, { tollFee: 600, driverChildPays: false }).share, 600);
+});
+
+const views = (outRiders, backRiders) => ({
+  out: { cars: [carOf(outRiders)], unassigned: [] },
+  back: { cars: [carOf(backRiders)], unassigned: [] },
+});
+test('往復で乗る部員は片道ごとの負担の合計になる', () => {
+  const s = tollSummary({ tollOut: true, tollBack: true }, views([C('k1'), C('k2'), C('k3')], [C('k1'), C('k2')]));
+  const k1 = s.players.find((p) => p.person.id === 'k1');
+  eq([k1.out, k1.back, k1.total], [200, 300, 500]);
+  eq(s.drivers[0].total, 1200);
+});
+test('有料道路がない方向は料金が発生しない', () => {
+  const s = tollSummary({ tollOut: true, tollBack: false }, views([C('k1')], [C('k1')]));
+  eq(s.players[0].total, 600);
+});
+
+const ev = { title: '練習試合', date: '2026-11-15', destination: '市民球場', meetTime: '8:00', meetPlace: '学校', tollOut: true, tollBack: false };
+test('日付に曜日が付く', () => eq(formatDate('2026-11-15'), '11/15(日)'));
+test('お知らせに回答URLが入る', () => {
+  ok(buildAnnouncement(ev, 'https://x/#/a/1').includes('https://x/#/a/1'), 'URLがある');
+});
+test('配車結果に車と料金が入る', () => {
+  const t = buildResultText(ev, views([C('k1'), C('k3')], [C('k1')]));
+  ok(t.startsWith('【配車のお知らせ】'), '見出し');
+  ok(t.includes('dad号：k1、k3'), '同乗者');
+  ok(t.includes('1人300円'), '料金');
+});
+test('共有後に配車を変えると変更のお知らせになる', () => {
+  const v1 = views([C('k1')], [C('k1')]);
+  const shared = { ...ev, sharedBody: buildResultBody(ev, v1) };
+  ok(buildResultText(shared, v1).startsWith('【配車のお知らせ】'), '同じ内容');
+  ok(buildResultText(shared, views([C('k3')], [C('k1')])).startsWith('【配車変更のお知らせ】'), '変更');
+});
+test('LINE共有URLは本文をエンコードする', () => {
+  ok(lineShareUrl('a b\n&').endsWith('a%20b%0A%26'), 'エンコード');
+});
+
+test('監督は車を出せて、代表は同乗できる', () => {
+  const staff = [C('k1'), { id: 'co', name: 'co', type: 'coach' }, { id: 're', name: 're', type: 'rep' }];
+  const r = { k1: yes('ride'), co: yes('car', 'car', 3), re: yes('ride') };
+  const c = candidates(staff, r, 'out');
+  eq([c.drivers.map((d) => d.id), c.riders.map((p) => p.id)], [['co'], ['k1', 're']]);
+});
+test('監督・代表が乗っても道路料金の人数に入らない', () => {
+  const t = tollForCar(carOf([C('k1'), { id: 'co', type: 'coach' }, { id: 're', type: 'rep' }]), 600);
+  eq([t.payers.length, t.share], [1, 600]);
+});
+
+test('世帯の参加は父母の回答から決まる', () => {
+  eq([
+    householdAttend({ father: 'yes', mother: 'no' }),
+    householdAttend({ father: 'shuttle', mother: 'no' }),
+    householdAttend({ father: 'shuttle', mother: 'yes' }),
+    householdAttend({ father: 'no', mother: 'no' }),
+  ], ['yes', 'shuttle', 'yes', 'no']);
+});
+test('父母2人が参加する世帯の同乗は2席', () => {
+  const h = { id: 'h', type: 'parent' };
+  eq([
+    seatCount(h, { father: 'yes', mother: 'yes' }),
+    seatCount(h, { father: 'yes', mother: 'shuttle' }),
+    seatCount(C('k1'), {}),
+  ], [2, 1, 1]);
+});
+test('2席必要な世帯は空きが1席の車に自動で入れない', () => {
+  const people = [P('drv'), P('fam')];
+  const r = {
+    drv: yes('car', 'car', 1),
+    fam: { attend: 'yes', father: 'yes', mother: 'yes', out: 'ride', back: 'ride' },
+  };
+  const v = allocationView(autoAssign(people, r, 'out'), people, r, 'out');
+  eq(v.unassigned.map((p) => p.id), ['fam']);
+});
+test('2席の世帯は使用席数と配車結果に人数が出る', () => {
+  const people = [P('drv'), P('fam')];
+  const r = {
+    drv: yes('car', 'car', 3),
+    fam: { attend: 'yes', father: 'yes', mother: 'yes', out: 'ride', back: 'ride' },
+  };
+  const v = allocationView(autoAssign(people, r, 'out'), people, r, 'out');
+  eq(v.cars[0].used, 2);
+  const event = { title: 't', date: '2026-11-15', destination: 'd', meetTime: '8:00', tollOut: false, tollBack: false };
+  ok(buildResultText(event, { out: v, back: { cars: [], unassigned: [] } }).includes('fam（2人）'), '人数表記');
+});
+
+let seq = 0;
+const nid = () => `n${++seq}`;
+test('見出し行を飛ばし、4区分と父母を読み取る', () => {
+  const rows = parseRoster('名前,区分\n青木 蓮,部員\n青木 父,保護者\n石田 母,父母\n佐々木,監督\n田村,代表', []);
+  eq(rows.map((r) => r.type), ['player', 'parent', 'parent', 'coach', 'rep']);
+});
+test('Excelのタブ区切りを読める', () => {
+  eq(parseRoster('青木 蓮\t部員', [])[0].name, '青木 蓮');
+});
+test('引用符付きCSVを読める', () => {
+  const rows = parseRoster('A,部員\nB,部員\nC,保護者,"A、B"', []);
+  eq(rows[2].childNames, ['A', 'B']);
+});
+test('空行とカンマだけの行は無視する', () => {
+  eq(parseRoster('A,部員\n\n,,\n', []).length, 1);
+});
+test('不明な区分と区分なしはエラー', () => {
+  const rows = parseRoster('A,コーチ\nB', []);
+  eq(rows.map((r) => r.status), ['error', 'error']);
+});
+test('登録済みと貼り付け内の重複は飛ばす', () => {
+  const rows = parseRoster('A,部員\nB,部員\nB,部員', [{ id: '1', name: 'A', type: 'player' }]);
+  eq(rows.map((r) => r.status), ['duplicate', 'new', 'duplicate']);
+});
+test('同じ名前でも区分が違えば別人として登録する', () => {
+  eq(parseRoster('A,保護者', [{ id: '1', name: 'A', type: 'player' }])[0].status, 'new');
+});
+test('お子さんを同時に取り込んだ部員へ紐付ける', () => {
+  const next = applyRoster([], parseRoster('父,保護者,太郎\n太郎,部員', []), nid);
+  eq(next[0].childIds, [next[1].id]);
+  ok(!('childNames' in next[0]), '一時項目を残さない');
+});
+test('既存の部員にも紐付け、いない子は注意を出す', () => {
+  const roster = [{ id: 'x', name: '太郎', type: 'player' }];
+  const rows = parseRoster('父,保護者,太郎・次郎', roster);
+  ok(rows[0].note.includes('次郎'), '注意');
+  eq(applyRoster(roster, rows, nid)[1].childIds, ['x']);
+});
+test('エラーと重複は登録されない', () => {
+  const roster = [{ id: 'x', name: 'A', type: 'player' }];
+  eq(applyRoster(roster, parseRoster('A,部員\nB,不明\nC,監督', roster), nid).map((p) => p.name), ['A', 'C']);
+});
+test('Shift_JISのCSVを読める', () => {
+  eq(decodeRosterFile(new Uint8Array([0x95, 0x94, 0x88, 0xF5]).buffer), '部員');
+});
+test('UTF-8のCSVを読める', () => {
+  eq(decodeRosterFile(new TextEncoder().encode('部員').buffer), '部員');
+});
+
+// ---- 台数制限と車の使う／使わない ----
+test('台数制限で多く乗せられる車から選び、残りは使わない', () => {
+  const r = baseResponses(); // dad: 2席＋自分の子k2、mom: 2席
+  const cars = autoAssign(roster, r, 'out', { maxCars: 1 });
+  eq(cars.filter((c) => !c.off).map((c) => c.driverId), ['dad']);
+  eq(cars.filter((c) => c.off).map((c) => c.driverId), ['mom']);
+});
+test('使わない車の世帯は同乗者になり、席を使う', () => {
+  const r = baseResponses();
+  const cars = autoAssign(roster, r, 'out', { maxCars: 1 });
+  const v = allocationView(cars, roster, r, 'out');
+  eq(v.off.map((p) => p.id), ['mom']);
+  const dad = v.cars.find((c) => c.driver.id === 'dad');
+  ok(dad.riders.some((x) => x.person.id === 'mom') || v.unassigned.some((p) => p.id === 'mom'), 'momは同乗者');
+  ok(dad.used <= dad.seats, '定員内');
+});
+test('台数制限は道具車1台を含めて数える', () => {
+  eq(maxCarsOf({ carLimit: 5 }), 4);
+  eq(maxCarsOf({}), undefined);
+  const v = { cars: [{ driverStale: false }, { driverStale: false }], unassigned: [] };
+  eq(carCount({ carLimit: 3 }, v), { limit: 3, used: 3, over: false });
+  eq(carCount({ carLimit: 2 }, v).over, true);
+  eq(carCount({}, v), { limit: 0, used: 2, over: false });
+});
+test('配車後に車を使わないにすると、乗っていた人は未割当に戻る', () => {
+  const r = baseResponses();
+  let cars = autoAssign(roster, r, 'out');
+  cars = setCarUsed(cars, 'dad', false);
+  const v = allocationView(cars, roster, r, 'out');
+  ok(!v.cars.some((c) => c.driver.id === 'dad'), 'dadの車はない');
+  ok(v.unassigned.some((p) => p.id === 'k2') || v.cars.some((c) => c.riders.some((x) => x.person.id === 'k2')), 'k2は同乗者のまま');
+  ok(v.unassigned.some((p) => p.id === 'dad'), 'dadは同乗者');
+  cars = setCarUsed(cars, 'dad', true);
+  ok(allocationView(cars, roster, r, 'out').cars.some((c) => c.driver.id === 'dad'), '使うに戻せる');
+});
+test('自分の子も手動で別の車へ移せる', () => {
+  const r = baseResponses();
+  const cars = moveRider(autoAssign(roster, r, 'out'), 'k2', 'mom');
+  const v = allocationView(cars, roster, r, 'out');
+  ok(v.cars.find((c) => c.driver.id === 'mom').riders.some((x) => x.person.id === 'k2'), 'momの車');
+  ok(!v.cars.find((c) => c.driver.id === 'dad').riders.some((x) => x.person.id === 'k2'), 'dadの車にはいない');
+});
+test('台数制限は文面に出る', () => {
+  ok(buildAnnouncement({ title: 't', date: '2026-11-15', destination: 'd', meetTime: '8:00', carLimit: 5 }, 'u').includes('台数制限：5台（道具車1台を含む）'), '台数');
+});
+
+// ---- 学年と活動の対象 ----
+test('学年が対象の活動は、その学年の部員と世帯だけに絞る', () => {
+  const hi = { id: 'h1', name: 'h1', type: 'player', grade: 'high' };
+  const lo = { id: 'l1', name: 'l1', type: 'player', grade: 'low' };
+  const none = { id: 'n1', name: 'n1', type: 'player' };
+  const both = { id: 'g1', name: '中村', type: 'parent', childIds: ['h1', 'l1'] };
+  const hiOnly = { id: 'g2', name: '青木', type: 'parent', childIds: ['h1'] };
+  const coach = { id: 's1', name: '監督', type: 'coach' };
+  const r = [hi, lo, none, both, hiOnly, coach];
+  eq(eventRoster({ target: 'low' }, r).map((p) => p.id), ['l1', 'g1', 's1']);
+  eq(eventRoster({ target: 'low' }, r).find((p) => p.id === 'g1').childIds, ['l1']);
+  eq(eventRoster({}, r).length, 6);
+  eq(eventRoster({ target: 'all' }, r).length, 6);
+  eq(both.childIds, ['h1', 'l1']);
+});
+test('名簿の取り込みで高学年・低学年は学年付きの部員になる', () => {
+  const rows = parseRoster('青木 蓮,高学年\n中村 葵,低学年', []);
+  eq(rows.map((x) => [x.type, x.grade]), [['player', 'high'], ['player', 'low']]);
+  eq(applyRoster([], rows, () => 'x').map((p) => p.grade), ['high', 'low']);
+});
+test('対象が学年の活動は文面に対象が付く', () => {
+  ok(buildAnnouncement({ title: '練習', date: '2026-11-29', destination: 'd', meetTime: '8:00', target: 'low' }, 'u').includes('11/29(日) 練習（低学年）'), '対象');
+  ok(!buildAnnouncement({ title: '練習', date: '2026-11-29', destination: 'd', meetTime: '8:00' }, 'u').includes('（'), '全員は付けない');
+});
+
+// ---- 移動区間 ----
+const legs3 = [
+  { id: 'out', from: 'A小', to: 'Bグラウンド', toll: true },
+  { id: 'mid', from: 'Bグラウンド', to: 'C小', toll: false },
+  { id: 'back', from: 'C小', to: 'A小', toll: true },
+];
+test('区間未設定の活動は行き・帰りの2区間になる', () => {
+  eq(legsOf({ tollOut: true, tollBack: false }).map((l) => [l.id, l.toll]), [['out', true], ['back', false]]);
+  eq([legName(legsOf({}), 0), legName(legsOf({}), 1)], ['行き', '帰り']);
+});
+test('3区間は①②③で呼び、経路を付ける', () => {
+  eq(legs3.map((_, i) => legLabel(legs3, i)), ['①：A小→Bグラウンド', '②：Bグラウンド→C小', '③：C小→A小']);
+  eq(legRoute({ from: '', to: '' }), '');
+});
+test('3区間の配車は区間ごとに回答を見る', () => {
+  const r = { dad: { attend: 'yes', out: 'car', mid: 'none', back: 'car', seats: 2 }, k1: { attend: 'yes', out: 'ride', mid: 'ride', back: 'ride', seats: 0 } };
+  const people = [P('dad'), C('k1')];
+  eq(autoAssign(people, r, 'out')[0].riderIds, ['k1']);
+  eq(autoAssign(people, r, 'mid'), []);
+  eq(allocationView([], people, r, 'mid').unassigned.map((p) => p.id), ['k1']);
+});
+test('有料道路の区間ごとに料金を足す', () => {
+  const ev3 = { legs: legs3 };
+  const v = { out: { cars: [carOf([C('k1'), C('k2')])], unassigned: [] }, mid: { cars: [carOf([C('k1')])], unassigned: [] }, back: { cars: [carOf([C('k1'), C('k2'), C('k3')])], unassigned: [] } };
+  const k1 = tollSummary(ev3, v).players.find((p) => p.person.id === 'k1');
+  eq([k1.out, k1.mid, k1.back, k1.total], [300, undefined, 200, 500]);
+});
+test('3区間の配車結果とお知らせに区間が出る', () => {
+  const ev3 = { title: 't', date: '2026-11-15', destination: 'Bグラウンド', meetTime: '8:00', legs: legs3 };
+  const empty = { cars: [], unassigned: [] };
+  const body = buildResultBody(ev3, { out: empty, mid: empty });
+  ok(body.includes('＜①：A小→Bグラウンド＞有料道路あり'), '区間1');
+  ok(body.includes('＜②：Bグラウンド→C小＞\n車の提供なし'), '区間2');
+  ok(body.includes('＜③：C小→A小＞有料道路あり'), '配車がまだの区間も出る');
+  ok(buildAnnouncement(ev3, 'u').includes('移動：\n　①：A小→Bグラウンド'), 'お知らせ');
+});
+
+const failed = results.filter((r) => r.startsWith('FAIL')).length;
+document.getElementById('out').textContent = `${results.length - failed} passed, ${failed} failed\n\n${results.join('\n')}`;
+</script>

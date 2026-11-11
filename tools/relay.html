@@ -1,0 +1,15 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>relay</title>
+<p>Apps Script の編集画面へファイルを渡しています…</p>
+<script>
+// 貼り付け作業の補助：gas/ のファイルを URL の # 以降に入れて script.google.com のページへ渡す。
+// （# 以降はサーバーへ送られない）
+(async () => {
+  const files = {};
+  for (const name of ['Code.gs', 'index.html', 'appjs.html']) {
+    files[name] = await (await fetch(`../gas/${name}`, { cache: 'no-store' })).text();
+  }
+  location.href = `https://script.google.com/robots.txt#${encodeURIComponent(JSON.stringify(files))}`;
+})();
+</script>

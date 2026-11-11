@@ -1,0 +1,67 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>GAS harness</title>
+<p>Apps Script の動作を手元で再現して gas/index.html を表示します…</p>
+<script>
+// Apps Script の公開版（gas/Code.gs + gas/index.html）を手元で動かすための模擬環境。
+// スプレッドシートはこのブラウザの localStorage（gas-mock-rows）に保存する。
+// URL の ?hash=/a/xxx で「LINEで送ったURL」の # 以降を再現できる。
+(async () => {
+  const ROWS_KEY = 'gas-mock-rows';
+  const rows = JSON.parse(localStorage.getItem(ROWS_KEY) || '[]');
+  const saveRows = () => localStorage.setItem(ROWS_KEY, JSON.stringify(rows));
+  window.__gasCalls = [];
+
+  const range = (r, c, nr = 1, nc = 1) => ({
+    getValues: () => Array.from({ length: nr }, (_, i) => Array.from({ length: nc }, (_, j) => (rows[r - 1 + i] || [])[c - 1 + j] ?? '')),
+    setValue: (v) => { rows[r - 1] = rows[r - 1] || ['', '']; rows[r - 1][c - 1] = String(v); saveRows(); },
+    setValues: (vals) => { vals.forEach((row, i) => { rows[r - 1 + i] = row.map(String); }); saveRows(); },
+    setNumberFormat() { return this; },
+  });
+  const sheet = {
+    getLastRow: () => rows.length,
+    getRange: range,
+    deleteRow: (r) => { rows.splice(r - 1, 1); saveRows(); },
+  };
+  const book = { getSheetByName: () => sheet, insertSheet: () => sheet };
+  window.SpreadsheetApp = { getActiveSpreadsheet: () => book, openById: () => book };
+  window.LockService = { getScriptLock: () => ({ waitLock() {}, releaseLock() {} }) };
+  const appCode = await (await fetch('../gas/appjs.html', { cache: 'no-store' })).text();
+  window.ScriptApp = { getService: () => ({ getUrl: () => `${location.origin}${location.pathname}` }) };
+  window.HtmlService ={ createHtmlOutputFromFile: (name) => ({ getContent: () => (name === 'appjs' ? appCode : '') }) };
+  window.PropertiesService ={ getScriptProperties: () => ({ getProperty: (k) => (k === 'ADMIN_PASSWORD' ? 'test-pass' : null) }) };
+
+  (0, eval)(await (await fetch('../gas/Code.gs', { cache: 'no-store' })).text());
+
+  const runner = (ok, fail) => new Proxy({}, {
+    get(_, name) {
+      if (name === 'withSuccessHandler') return (fn) => runner(fn, fail);
+      if (name === 'withFailureHandler') return (fn) => runner(ok, fn);
+      return (...args) => setTimeout(() => {
+        window.__gasCalls.push(name);
+        try {
+          // Apps Script は引数と戻り値を JSON 相当に変換して受け渡す
+          const result = window[name](...JSON.parse(JSON.stringify(args)));
+          ok && ok(result === undefined ? undefined : JSON.parse(JSON.stringify(result)));
+        } catch (e) {
+          fail && fail(e);
+        }
+      }, 30);
+    },
+  });
+  const initialHash = new URLSearchParams(location.search).get('hash') || '';
+  window.google = {
+    script: {
+      run: runner(null, null),
+      url: { getLocation: (cb) => setTimeout(() => cb({ hash: initialHash, parameter: {} }), 10) },
+      history: { replace: (s, p, hash) => { window.__lastHistory = hash; } },
+    },
+  };
+
+  const html = (await (await fetch('../gas/index.html', { cache: 'no-store' })).text())
+    .replace('/*APP_URL*/null', () => JSON.stringify(`${location.origin}${location.pathname}`));
+  document.open();
+  document.write(html);
+  document.close();
+})();
+</script>

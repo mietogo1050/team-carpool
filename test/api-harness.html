@@ -1,0 +1,52 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>API harness</title>
+<p>GitHub Pages 版（API 経由）を手元で再現しています…</p>
+<script>
+// GitHub Pages 版の画面（index.html + src/）が、Apps Script の doPost を呼ぶ流れを手元で再現する。
+// fetch(API_URL) を横取りして gas/Code.gs の doPost に渡す。スプレッドシートは localStorage（gas-mock-rows）。
+// 使い方: /test/api-harness.html#/  （# 以降はアプリの画面）
+(async () => {
+  const ROWS_KEY = 'gas-mock-rows';
+  const rows = JSON.parse(localStorage.getItem(ROWS_KEY) || '[]');
+  const saveRows = () => localStorage.setItem(ROWS_KEY, JSON.stringify(rows));
+  window.__apiCalls = [];
+  const range = (r, c, nr = 1, nc = 1) => ({
+    getValues: () => Array.from({ length: nr }, (_, i) => Array.from({ length: nc }, (_, j) => (rows[r - 1 + i] || [])[c - 1 + j] ?? '')),
+    setValue: (v) => { rows[r - 1] = rows[r - 1] || ['', '']; rows[r - 1][c - 1] = String(v); saveRows(); },
+    setValues: (vals) => { vals.forEach((row, i) => { rows[r - 1 + i] = row.map(String); }); saveRows(); },
+    setNumberFormat() { return this; },
+  });
+  const sheet = { getLastRow: () => rows.length, getRange: range, deleteRow: (r) => { rows.splice(r - 1, 1); saveRows(); } };
+  const book = { getSheetByName: () => sheet, insertSheet: () => sheet };
+  window.SpreadsheetApp = { getActiveSpreadsheet: () => book, openById: () => book };
+  window.LockService = { getScriptLock: () => ({ waitLock() {}, releaseLock() {} }) };
+  window.PropertiesService = { getScriptProperties: () => ({ getProperty: (k) => (k === 'ADMIN_PASSWORD' ? 'test-pass' : null) }) };
+  window.ContentService = {
+    MimeType: { JSON: 'json' },
+    createTextOutput: (text) => ({ text, setMimeType() { return this; } }),
+  };
+  (0, eval)(await (await fetch('../gas/Code.gs', { cache: 'no-store' })).text());
+
+  const realFetch = window.fetch.bind(window);
+  window.fetch = async (url, opts = {}) => {
+    if (String(url).startsWith('https://script.google.com/macros/')) {
+      const body = JSON.parse(opts.body);
+      window.__apiCalls.push(body.fn);
+      await new Promise((r) => setTimeout(r, 30));
+      const out = window.doPost({ postData: { contents: opts.body } });
+      return new Response(out.text, { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    return realFetch(url, opts);
+  };
+
+  // アプリ本体を読み込む（?api で API を使う）
+  if (!location.search.includes('api')) {
+    history.replaceState(null, '', `${location.pathname}?api${location.hash}`);
+  }
+  const html = await (await realFetch('../index.html', { cache: 'no-store' })).text();
+  document.open();
+  document.write(html.replace('<head>', '<head><base href="../">'));
+  document.close();
+})();
+</script>
